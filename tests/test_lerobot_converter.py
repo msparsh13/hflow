@@ -836,6 +836,42 @@ def test_fetch_info_json_malformed_json_raises_contextual_value_error(
     assert isinstance(excinfo.value.__cause__, json.JSONDecodeError)
 
 
+def test_fetch_info_json_rejects_missing_info_json(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    body = json.dumps([{"path": "meta/other.json", "type": "file"}]).encode()
+    _stub_urlopen(monkeypatch, {"/tree/": body})
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"meta/info.json not found; not a LeRobot v3 repository",
+    ):
+        prep._fetch_info_json("lerobot/pusht", "main", tmp_path)
+
+    assert not (tmp_path / "meta" / "info.json").exists()
+
+
+def test_fetch_info_json_rejects_non_object(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    tree_body = json.dumps([{"path": "meta/info.json", "type": "file"}]).encode()
+
+    _stub_urlopen(
+        monkeypatch,
+        {"/tree/": tree_body, "/resolve/": b"[]"},
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=r"LeRobot meta/info.json is not a JSON object",
+    ):
+        prep._fetch_info_json("lerobot/pusht", "main", tmp_path)
+
+    assert not (tmp_path / "meta" / "info.json").exists()
+
+
 def test_hf_repo_info_valid_json_still_resolves(monkeypatch: pytest.MonkeyPatch) -> None:
     # A real resolved commit sha: at least the 7 hex characters the sha
     # validation requires, since a cache directory is named after it.
@@ -958,6 +994,66 @@ def test_hf_repo_info_wrong_shape_refusal_unchanged(
         prep._hf_repo_info("lerobot/pusht", "main")
 
 
+def test_hf_tree_rejects_invalid_next_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first_page = json.dumps([{"path": "meta/info.json", "type": "file"}]).encode()
+    invalid_next_url = "https://[invalid"
+    _stub_urlopen(
+        monkeypatch,
+        {"/tree/": first_page},
+        {"/tree/": {"Link": f'<{invalid_next_url}>; rel="next"'}},
+        max_requests=1,
+    )
+
+    with pytest.raises(ValueError, match="contains an invalid pagination URL"):
+        prep._hf_tree("lerobot/pusht", "main", "meta")
+
+
+def test_hf_tree_rejects_repeated_pagination_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first_page = json.dumps(
+        [{"path": "meta/info.json", "type": "file"}]
+    ).encode()
+
+    repeated_url = (
+        "https://huggingface.co/api/datasets/lerobot/pusht/tree/main/meta"
+        "?recursive=true"
+    )
+
+    _stub_urlopen(
+        monkeypatch,
+        {"/tree/": first_page},
+        {"/tree/": {"Link": f'<{repeated_url}>; rel="next"'}},
+        max_requests=1,
+    )
+
+    with pytest.raises(ValueError, match="already fetched"):
+        prep._hf_tree("lerobot/pusht", "main", "meta")
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        b"{}",
+        b'["not an object"]',
+        b'[{"path": "meta/info.json"}, "not an object"]',
+    ],
+)
+def test_hf_tree_rejects_non_list_of_objects(
+    monkeypatch: pytest.MonkeyPatch,
+    body: bytes,
+) -> None:
+    _stub_urlopen(monkeypatch, {"/tree/": body})
+
+    with pytest.raises(
+        ValueError,
+        match="Hugging Face tree response for 'meta' is not a list of objects",
+    ):
+        prep._hf_tree("lerobot/pusht", "main", "meta")
+
+
 @pytest.mark.parametrize(
     "bad_fps",
     [
@@ -1012,6 +1108,105 @@ def test_info_json_refuses_non_finite_or_non_positive_fps(
     assert repr(expected_value) in message
     # Refusal happens before episode metadata discovery: no downloads, no output.
     assert not cache_dir.exists() or not (cache_dir / "meta" / "episodes").exists()
+
+
+def test_ensure_source_archive_rejects_empty_data_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    info = {
+        "fps": 30,
+        "data_path": "",
+        "video_path": ("videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4"),
+        "features": {},
+    }
+
+    monkeypatch.setattr(
+        prep,
+        "_fetch_info_json",
+        lambda repo, revision, cache: info,
+    )
+
+    dataset_source = prep.DatasetSource(
+        repo_id="fake/repo",
+        revision="abc",
+        license="apache-2.0",
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=r"LeRobot meta/info.json must define a non-empty data_path template",
+    ):
+        prep._ensure_source_archive(dataset_source, tmp_path)
+
+    assert not (tmp_path / "meta" / "episodes").exists()
+
+
+def test_ensure_source_archive_rejects_empty_video_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    info = {
+        "fps": 30,
+        "data_path": ("data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet"),
+        "video_path": " ",
+        "features": {},
+    }
+
+    monkeypatch.setattr(
+        prep,
+        "_fetch_info_json",
+        lambda repo, revision, cache: info,
+    )
+
+    dataset_source = prep.DatasetSource(
+        repo_id="fake/repo",
+        revision="abc",
+        license="apache-2.0",
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=r"LeRobot meta/info.json must define a non-empty video_path template",
+    ):
+        prep._ensure_source_archive(dataset_source, tmp_path)
+
+    assert not (tmp_path / "meta" / "episodes").exists()
+
+
+def test_ensure_source_archive_rejects_missing_episode_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    info = {
+        "fps": 30,
+        "data_path": ("data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet"),
+        "video_path": ("videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4"),
+        "features": {},
+    }
+
+    monkeypatch.setattr(
+        prep,
+        "_fetch_info_json",
+        lambda repo, revision, cache: info,
+    )
+    monkeypatch.setattr(
+        prep,
+        "_hf_tree",
+        lambda repo, revision, path: [],
+    )
+
+    dataset_source = prep.DatasetSource(
+        repo_id="fake/repo",
+        revision="abc",
+        license="apache-2.0",
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="no meta/episodes parquet files found",
+    ):
+        prep._ensure_source_archive(dataset_source, tmp_path)
 
 
 def test_info_json_accepts_normal_positive_fps(
